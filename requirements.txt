@@ -1,0 +1,4 @@
+anthropic==0.96.0
+streamlit==1.52.0
+python-dotenv==1.2.2
+pandas==2.3.3
