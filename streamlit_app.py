@@ -736,35 +736,61 @@ with tab_planner:
             label = f"{created}  —  {plan_period} plan"
 
             with st.expander(label):
-                st.markdown(plan_row["plan_text"])
+                editing_plan = st.session_state.get("editing_plan_id") == pid
 
-                st.divider()
-                st.markdown("**Add to Planner**")
-
-                parsed = _parse_meal_plan(plan_row["plan_text"])
-                if not parsed:
-                    st.warning("Could not parse meals from this plan — try regenerating.")
+                if editing_plan:
+                    new_text = st.text_area(
+                        "Edit plan text",
+                        value=plan_row["plan_text"],
+                        height=300,
+                        key=f"edit_plan_text_{pid}",
+                    )
+                    ep_col1, ep_col2 = st.columns(2)
+                    if ep_col1.button("Save changes", type="primary", key=f"ep_save_{pid}"):
+                        update_meal_plan(pid, uid, new_text.strip())
+                        st.session_state.pop("editing_plan_id", None)
+                        st.session_state["_goto_tab"] = 4
+                        st.rerun()
+                    if ep_col2.button("Cancel", key=f"ep_cancel_{pid}"):
+                        st.session_state.pop("editing_plan_id", None)
+                        st.session_state["_goto_tab"] = 4
+                        st.rerun()
                 else:
-                    add_col1, add_col2 = st.columns([1, 1])
-                    with add_col1:
-                        start_date = st.date_input(
-                            "Start date", value=date.today(), key=f"plan_date_{pid}"
-                        )
-                    with add_col2:
-                        st.write("")
-                        if st.button(f"Add {len(parsed)} meals to Planner", type="primary", key=f"add_plan_{pid}"):
-                            meals_with_dates = [
-                                {**m, "planned_date": str(start_date + pd.Timedelta(days=m["day"] - 1))}
-                                for m in parsed
-                            ]
-                            activate_meal_plan(uid, pid, meals_with_dates)
-                            st.success(f"Added {len(parsed)} meals to your Planner!")
+                    st.markdown(plan_row["plan_text"])
 
-                st.divider()
-                if st.button("Delete this plan", type="secondary", key=f"del_plan_{pid}"):
-                    delete_meal_plan(pid, uid)
-                    st.session_state["_goto_tab"] = 4
-                    st.rerun()
+                    st.divider()
+                    act_col1, act_col2, act_col3 = st.columns([1, 1, 1])
+
+                    with act_col1:
+                        if act_col1.button("✏️ Edit plan", key=f"ep_open_{pid}"):
+                            st.session_state["editing_plan_id"] = pid
+                            st.session_state["_goto_tab"] = 4
+                            st.rerun()
+
+                    parsed = _parse_meal_plan(plan_row["plan_text"])
+                    if parsed:
+                        with act_col2:
+                            start_date = st.date_input(
+                                "Start date", value=date.today(), key=f"plan_date_{pid}"
+                            )
+                        with act_col3:
+                            st.write("")
+                            if st.button(f"Add {len(parsed)} meals →", type="primary", key=f"add_plan_{pid}"):
+                                meals_with_dates = [
+                                    {**m, "planned_date": str(start_date + pd.Timedelta(days=m["day"] - 1))}
+                                    for m in parsed
+                                ]
+                                activate_meal_plan(uid, pid, meals_with_dates)
+                                st.success(f"Added {len(parsed)} meals to your Planner!")
+                    else:
+                        with act_col2:
+                            st.warning("Could not parse meals — try editing the plan text.")
+
+                    st.divider()
+                    if st.button("Delete this plan", type="secondary", key=f"del_plan_{pid}"):
+                        delete_meal_plan(pid, uid)
+                        st.session_state["_goto_tab"] = 4
+                        st.rerun()
 
     # ── My Planner ────────────────────────────────────────────────────────────
     st.divider()
@@ -793,7 +819,9 @@ with tab_planner:
                     meal_id   = row["id"]
                     is_done   = bool(row["done"])
                     meal_text = f"**{row['meal_type']}** — {row['meal_name']} · {row['calories']} cal"
-                    c1, c2, c3 = st.columns([0.04, 0.82, 0.14])
+                    editing_this = st.session_state.get("editing_planned_id") == meal_id
+
+                    c1, c2, c3, c4 = st.columns([0.04, 0.72, 0.12, 0.12])
                     with c1:
                         checked = st.checkbox(
                             "", value=is_done, key=f"done_{meal_id}",
@@ -809,10 +837,44 @@ with tab_planner:
                         else:
                             st.markdown(meal_text)
                     with c3:
-                        if st.button("✕", key=f"rm_meal_{meal_id}", help="Remove"):
-                            delete_planned_meal(meal_id, uid)
+                        if st.button("✏️", key=f"edit_meal_{meal_id}", help="Edit"):
+                            if editing_this:
+                                st.session_state.pop("editing_planned_id", None)
+                            else:
+                                st.session_state["editing_planned_id"] = meal_id
                             st.session_state["_goto_tab"] = 4
                             st.rerun()
+                    with c4:
+                        if st.button("✕", key=f"rm_meal_{meal_id}", help="Remove"):
+                            delete_planned_meal(meal_id, uid)
+                            st.session_state.pop("editing_planned_id", None)
+                            st.session_state["_goto_tab"] = 4
+                            st.rerun()
+
+                    if editing_this:
+                        with st.form(key=f"edit_meal_form_{meal_id}"):
+                            ef_col1, ef_col2, ef_col3 = st.columns([1, 2, 1])
+                            e_type = ef_col1.selectbox(
+                                "Type",
+                                ["Breakfast", "Lunch", "Dinner", "Snacks", "Other"],
+                                index=["Breakfast","Lunch","Dinner","Snacks","Other"].index(row["meal_type"])
+                                      if row["meal_type"] in ["Breakfast","Lunch","Dinner","Snacks","Other"] else 4,
+                                key=f"ef_type_{meal_id}",
+                            )
+                            e_name = ef_col2.text_input("Meal", value=row["meal_name"], key=f"ef_name_{meal_id}")
+                            e_cal  = ef_col3.number_input("Cal", min_value=0, max_value=5000, step=5,
+                                                          value=int(row["calories"]), key=f"ef_cal_{meal_id}")
+                            fs1, fs2 = st.columns(2)
+                            if fs1.form_submit_button("Save", type="primary"):
+                                if e_name.strip():
+                                    update_planned_meal(meal_id, uid, e_type, e_name.strip(), e_cal)
+                                    st.session_state.pop("editing_planned_id", None)
+                                    st.session_state["_goto_tab"] = 4
+                                    st.rerun()
+                            if fs2.form_submit_button("Cancel"):
+                                st.session_state.pop("editing_planned_id", None)
+                                st.session_state["_goto_tab"] = 4
+                                st.rerun()
 
 
 # ── Tab 5: Calorie Lookup ─────────────────────────────────────────────────────
