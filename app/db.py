@@ -54,11 +54,48 @@ def init_db():
             )
         """)
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS meal_plans (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id),
+                period     TEXT    NOT NULL,
+                plan_text  TEXT    NOT NULL,
+                created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS ai_usage (
                 user_id         INTEGER NOT NULL REFERENCES users(id),
                 date            TEXT    NOT NULL,
                 request_count   INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (user_id, date)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                user_id         INTEGER PRIMARY KEY REFERENCES users(id),
+                name            TEXT,
+                age             INTEGER,
+                gender          TEXT,
+                height_cm       REAL,
+                goal_weight_lbs REAL,
+                target_date     TEXT,
+                activity_level  TEXT,
+                dietary_prefs   TEXT,
+                allergies       TEXT,
+                updated_at      TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS planned_meals (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL REFERENCES users(id),
+                plan_id      INTEGER REFERENCES meal_plans(id),
+                day_number   INTEGER NOT NULL DEFAULT 1,
+                meal_type    TEXT    NOT NULL,
+                meal_name    TEXT    NOT NULL,
+                calories     INTEGER NOT NULL DEFAULT 0,
+                planned_date TEXT    NOT NULL,
+                done         INTEGER NOT NULL DEFAULT 0
             )
         """)
         # Purge expired sessions on every startup
@@ -154,6 +191,44 @@ def delete_session(token: str) -> None:
         conn.commit()
 
 
+# ── Meal plan helpers ─────────────────────────────────────────────────────────
+
+def save_meal_plan(user_id: int, period: str, plan_text: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO meal_plans (user_id, period, plan_text) VALUES (?, ?, ?)",
+            (user_id, period, plan_text),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_meal_plans(user_id: int) -> list:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM meal_plans WHERE user_id = ? ORDER BY created_at DESC",
+            (user_id,),
+        ).fetchall()
+
+
+def update_meal_plan(plan_id: int, user_id: int, plan_text: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE meal_plans SET plan_text = ? WHERE id = ? AND user_id = ?",
+            (plan_text, plan_id, user_id),
+        )
+        conn.commit()
+
+
+def delete_meal_plan(plan_id: int, user_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM meal_plans WHERE id = ? AND user_id = ?",
+            (plan_id, user_id),
+        )
+        conn.commit()
+
+
 # ── Rate limiting ─────────────────────────────────────────────────────────────
 
 def get_usage_today(user_id: int) -> int:
@@ -164,6 +239,83 @@ def get_usage_today(user_id: int) -> int:
             (user_id, today),
         ).fetchone()
     return row["request_count"] if row else 0
+
+
+# ── Profile helpers ───────────────────────────────────────────────────────────
+
+def get_profile(user_id: int):
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM user_profiles WHERE user_id = ?", (user_id,)
+        ).fetchone()
+
+
+def save_profile(user_id: int, **fields) -> None:
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cols = ", ".join(fields.keys())
+    placeholders = ", ".join("?" * len(fields))
+    updates = ", ".join(f"{k} = excluded.{k}" for k in fields)
+    with get_conn() as conn:
+        conn.execute(
+            f"""INSERT INTO user_profiles (user_id, {cols}) VALUES (?, {placeholders})
+               ON CONFLICT (user_id) DO UPDATE SET {updates}""",
+            (user_id, *fields.values()),
+        )
+        conn.commit()
+
+
+# ── Planner helpers ───────────────────────────────────────────────────────────
+
+def activate_meal_plan(user_id: int, plan_id: int, meals: list[dict]) -> None:
+    """Insert parsed meals into planned_meals for the given start dates."""
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO planned_meals
+               (user_id, plan_id, day_number, meal_type, meal_name, calories, planned_date)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            [
+                (user_id, plan_id, m["day"], m["type"], m["name"],
+                 m["calories"], m["planned_date"])
+                for m in meals
+            ],
+        )
+        conn.commit()
+
+
+def get_planned_meals(user_id: int) -> list:
+    with get_conn() as conn:
+        return conn.execute(
+            """SELECT * FROM planned_meals WHERE user_id = ?
+               ORDER BY planned_date, day_number, id""",
+            (user_id,),
+        ).fetchall()
+
+
+def mark_planned_meal_done(meal_id: int, user_id: int, done: bool) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE planned_meals SET done = ? WHERE id = ? AND user_id = ?",
+            (1 if done else 0, meal_id, user_id),
+        )
+        conn.commit()
+
+
+def update_planned_meal(meal_id: int, user_id: int, meal_type: str, meal_name: str, calories: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE planned_meals SET meal_type=?, meal_name=?, calories=? WHERE id=? AND user_id=?",
+            (meal_type, meal_name, calories, meal_id, user_id),
+        )
+        conn.commit()
+
+
+def delete_planned_meal(meal_id: int, user_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "DELETE FROM planned_meals WHERE id = ? AND user_id = ?",
+            (meal_id, user_id),
+        )
+        conn.commit()
 
 
 def increment_usage(user_id: int) -> int:

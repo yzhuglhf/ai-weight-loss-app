@@ -8,6 +8,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import extra_streamlit_components as stx
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 from datetime import date
 from dotenv import load_dotenv
@@ -19,12 +20,15 @@ from app.db import (
     authenticate, create_user, get_user_by_email,
     create_session, get_session_user, delete_session,
     get_usage_today, increment_usage,
+    get_profile, save_profile,
+    save_meal_plan, get_meal_plans, update_meal_plan, delete_meal_plan,
+    activate_meal_plan, get_planned_meals, mark_planned_meal_done, update_planned_meal, delete_planned_meal,
 )
 from app.services.ai import chat, generate_meal_plan, analyze_food_image, analyze_food_text
 
 init_db()
 
-st.set_page_config(page_title="AI Weight Loss Coach", layout="wide")
+st.set_page_config(page_title="NutriCoach", layout="wide")
 
 # Hide the CookieManager iframe (extra-streamlit-components renders a blank component)
 # and tighten the default top padding.
@@ -58,6 +62,63 @@ def _check_rate_limit(user_id: int) -> bool:
     return True
 
 
+def _parse_meal_plan(text: str) -> list[dict]:
+    """Extract structured meals from a generated plan. Returns [{day, type, name, calories}].
+
+    Handles common AI output variations:
+    - Day headers: **Day 1**, **Day 1:**, ### Day 1, **Today**
+    - Meal prefixes: - Breakfast:, * Breakfast:, **Breakfast:**
+    - Calorie formats: (~350 cal), ~350 cal, (~350 calories), (350 kcal)
+    """
+    meals, day = [], 1
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+
+        # Day header — flexible: **Day 2**, ### Day 2, Day 2:, **Today**
+        dm = re.search(r"\bDay\s+(\d+)\b", line, re.IGNORECASE)
+        if dm:
+            day = int(dm.group(1))
+            continue
+        if re.search(r"\bToday\b", line, re.IGNORECASE) and re.search(r"\*\*|^#+\s", line):
+            day = 1
+            continue
+
+        # Skip summary / total lines
+        if re.search(r"\b(daily\s+total|total\s+cal)\b", line, re.IGNORECASE):
+            continue
+
+        # Meal type — allow bold markers and optional colon/space variations
+        type_m = re.search(
+            r"\*{0,2}(Breakfast|Lunch|Dinner|Snacks?|Morning\s+Snack|Afternoon\s+Snack)\*{0,2}"
+            r"[\s:*]+",
+            line, re.IGNORECASE,
+        )
+        if not type_m:
+            continue
+
+        # Calorie number — (~350 cal), ~350 calories, (350 kcal), 350 cal
+        cal_m = re.search(r"[~(]?\s*(\d[\d,]*)\s*(?:cal(?:ories)?|kcal)", line, re.IGNORECASE)
+        if not cal_m:
+            continue
+
+        # Meal name: text between the type label and the calorie marker
+        after_type = line[type_m.end():]
+        cal_pos = after_type.find(cal_m.group(0))
+        name = (after_type[:cal_pos] if cal_pos > 0 else after_type).strip().strip("(~").strip()
+        if not name:
+            continue
+
+        meals.append({
+            "day": day,
+            "type": type_m.group(1).strip("*").capitalize(),
+            "name": name,
+            "calories": int(cal_m.group(1).replace(",", "")),
+        })
+    return meals
+
+
 def _extract_scan_result(result: str) -> None:
     """Store analysis result and parse out the calorie number into session state."""
     st.session_state["scan_result"] = result
@@ -69,6 +130,53 @@ def _extract_scan_result(result: str) -> None:
                 cal_hint = int(nums[0])
             break
     st.session_state["scan_calories"] = cal_hint
+
+
+ACTIVITY_LEVELS = [
+    "Sedentary",
+    "Lightly active",
+    "Moderately active",
+    "Very active",
+    "Extra active",
+]
+ACTIVITY_DESC = {
+    "Sedentary": "desk job, little/no exercise",
+    "Lightly active": "light exercise 1–3 days/week",
+    "Moderately active": "moderate exercise 3–5 days/week",
+    "Very active": "hard exercise 6–7 days/week",
+    "Extra active": "physical job + daily training",
+}
+
+
+def _calc_tdee(profile, weight_lbs: float) -> int | None:
+    if not profile:
+        return None
+    age, gender, height_cm, activity = (
+        profile["age"], profile["gender"], profile["height_cm"], profile["activity_level"]
+    )
+    if not all([age, gender, height_cm, activity]):
+        return None
+    w_kg = weight_lbs / 2.20462
+    if gender == "Male":
+        bmr = 10 * w_kg + 6.25 * height_cm - 5 * age + 5
+    elif gender == "Female":
+        bmr = 10 * w_kg + 6.25 * height_cm - 5 * age - 161
+    else:
+        bmr = 10 * w_kg + 6.25 * height_cm - 5 * age - 78
+    mult = {"Sedentary": 1.2, "Lightly active": 1.375, "Moderately active": 1.55,
+            "Very active": 1.725, "Extra active": 1.9}[activity]
+    return round(bmr * mult)
+
+
+def _calc_bmi(weight_lbs: float, height_cm: float) -> float:
+    return round((weight_lbs / 2.20462) / (height_cm / 100) ** 2, 1)
+
+
+def _bmi_label(bmi: float) -> str:
+    if bmi < 18.5: return "Underweight"
+    if bmi < 25.0: return "Normal weight"
+    if bmi < 30.0: return "Overweight"
+    return "Obese"
 
 
 cookie_manager = stx.CookieManager()
@@ -87,7 +195,7 @@ if not st.session_state.get("user_id"):
 
 # ── Auth gate ─────────────────────────────────────────────────────────────────
 if not st.session_state.get("user_id"):
-    st.title("AI Weight Loss Coach")
+    st.title("NutriCoach")
 
     tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
 
@@ -154,14 +262,144 @@ with st.sidebar:
             st.session_state.pop(key, None)
         st.rerun()
 
-st.title("AI Weight Loss Coach")
+st.title("NutriCoach")
 
-tab_ai, tab_weight, tab_calories, tab_planner, tab_scanner = st.tabs(
-    ["AI Coach", "Weight Tracker", "Calorie Log", "Meal Planner", "Calorie Lookup"]
+# Restore the active tab after a rerun (set _goto_tab before calling st.rerun())
+if "_goto_tab" in st.session_state:
+    _tidx = st.session_state.pop("_goto_tab")
+    components.html(
+        f"""<script>
+        setTimeout(function(){{
+            var t=window.parent.document.querySelectorAll('[data-baseweb="tab"]');
+            if(t&&t.length>{_tidx})t[{_tidx}].click();
+        }},120);
+        </script>""",
+        height=0,
+    )
+
+# Load profile once per render — used by all tabs
+profile = get_profile(uid)
+
+tab_profile, tab_ai, tab_weight, tab_calories, tab_planner, tab_scanner = st.tabs(
+    ["My Profile", "AI Coach", "Weight Tracker", "Calorie Log", "Meal Planner", "Calorie Lookup"]
 )
 
 
-# ── Tab 1: AI Chat ────────────────────────────────────────────────────────────
+# ── Tab 1: Profile ───────────────────────────────────────────────────────────
+with tab_profile:
+    if not profile:
+        st.info("Complete your profile so the AI can give personalised advice and auto-calculate your calorie target.")
+
+    col_form, col_stats = st.columns([1, 1])
+
+    with col_form:
+        st.subheader("Personal Info")
+
+        # Unit toggles must be OUTSIDE the form so switching triggers an immediate rerun
+        h_unit = st.radio("Height unit", ["cm", "ft + in"], horizontal=True, key="prof_h_unit")
+        g_unit = st.radio("Goal weight unit", ["lbs", "kg"], horizontal=True, key="prof_g_unit")
+
+        with st.form("profile_form"):
+            p_name    = st.text_input("Name (optional)", value=profile["name"] or "" if profile else "")
+            p_age     = st.number_input("Age", min_value=10, max_value=120, step=1,
+                                        value=int(profile["age"]) if profile and profile["age"] else 25)
+            p_gender  = st.selectbox("Gender",
+                                     ["Male", "Female", "Prefer not to say"],
+                                     index=["Male","Female","Prefer not to say"].index(profile["gender"])
+                                     if profile and profile["gender"] else 0)
+
+            if h_unit == "cm":
+                p_height_cm = st.number_input("Height (cm)", min_value=100.0, max_value=250.0, step=0.5,
+                                              value=float(profile["height_cm"]) if profile and profile["height_cm"] else 170.0)
+            else:
+                _saved_cm = float(profile["height_cm"]) if profile and profile["height_cm"] else 170.18
+                _def_ft   = int(_saved_cm // 30.48)
+                _def_in   = round((_saved_cm % 30.48) / 2.54)
+                h_ft = st.number_input("Feet",   min_value=3, max_value=8,  step=1, value=_def_ft)
+                h_in = st.number_input("Inches", min_value=0, max_value=11, step=1, value=_def_in)
+                p_height_cm = round((h_ft * 12 + h_in) * 2.54, 1)
+
+            st.subheader("Your Goal")
+            if g_unit == "lbs":
+                p_goal_raw = st.number_input("Goal weight (lbs)", min_value=50.0, max_value=600.0, step=0.5,
+                                             value=float(profile["goal_weight_lbs"]) if profile and profile["goal_weight_lbs"] else 150.0)
+                p_goal_lbs = p_goal_raw
+            else:
+                _goal_kg_default = round(float(profile["goal_weight_lbs"]) / 2.20462, 1) if profile and profile["goal_weight_lbs"] else 68.0
+                p_goal_raw = st.number_input("Goal weight (kg)", min_value=20.0, max_value=300.0, step=0.5,
+                                             value=_goal_kg_default)
+                p_goal_lbs = round(p_goal_raw * 2.20462, 2)
+
+            p_target = st.date_input("Target date (optional)", value=None, min_value=date.today())
+
+            st.subheader("Activity & Food")
+            p_activity = st.selectbox(
+                "Activity level",
+                ACTIVITY_LEVELS,
+                format_func=lambda x: f"{x} — {ACTIVITY_DESC[x]}",
+                index=ACTIVITY_LEVELS.index(profile["activity_level"]) if profile and profile["activity_level"] else 1,
+            )
+            p_prefs    = st.text_input("Dietary preferences",
+                                       value=profile["dietary_prefs"] or "" if profile else "",
+                                       placeholder="e.g. vegetarian, low-carb")
+            p_allergies = st.text_input("Allergies / foods to avoid",
+                                        value=profile["allergies"] or "" if profile else "",
+                                        placeholder="e.g. nuts, dairy")
+
+            saved = st.form_submit_button("Save Profile", type="primary")
+
+        if saved:
+            save_profile(
+                uid,
+                name=p_name.strip() or None,
+                age=int(p_age),
+                gender=p_gender,
+                height_cm=p_height_cm,
+                goal_weight_lbs=p_goal_lbs,
+                target_date=str(p_target) if p_target else None,
+                activity_level=p_activity,
+                dietary_prefs=p_prefs.strip() or None,
+                allergies=p_allergies.strip() or None,
+            )
+            st.success("Profile saved!")
+            profile = get_profile(uid)
+            st.session_state["_goto_tab"] = 0
+            st.rerun()
+
+    with col_stats:
+        st.subheader("Your Stats")
+        with get_conn() as conn:
+            latest_w = conn.execute(
+                "SELECT weight_lbs FROM weight_logs WHERE user_id = ? ORDER BY date DESC LIMIT 1",
+                (uid,),
+            ).fetchone()
+        current_lbs = latest_w["weight_lbs"] if latest_w else None
+
+        if profile and current_lbs:
+            tdee = _calc_tdee(profile, current_lbs)
+            if tdee:
+                loss_target = tdee - 500
+                st.metric("Maintenance calories (TDEE)", f"{tdee:,} cal/day")
+                st.metric("Recommended for ~1 lb/week loss", f"{loss_target:,} cal/day")
+
+            if profile["height_cm"]:
+                bmi = _calc_bmi(current_lbs, profile["height_cm"])
+                label = _bmi_label(bmi)
+                st.metric("BMI", f"{bmi} — {label}")
+
+            if profile["goal_weight_lbs"] and current_lbs:
+                diff = current_lbs - profile["goal_weight_lbs"]
+                if diff > 0:
+                    weeks = round(diff / 1, 0)
+                    st.metric("Weight to lose", f"{diff:.1f} lbs",
+                              f"~{int(weeks)} weeks at 1 lb/week")
+                else:
+                    st.success("You have reached your goal weight!")
+        else:
+            st.info("Log your weight and complete your profile to see personalised stats here.")
+
+
+# ── Tab 2: AI Chat ────────────────────────────────────────────────────────────
 with tab_ai:
     st.subheader("Chat with your AI Coach")
     st.caption("Ask about meals, workouts, calorie estimates, or weight loss tips.")
@@ -181,7 +419,7 @@ with tab_ai:
         with st.chat_message("assistant"):
             if _check_rate_limit(uid):
                 with st.spinner("Thinking…"):
-                    reply = chat(st.session_state.messages)
+                    reply = chat(st.session_state.messages, profile=profile)
                 increment_usage(uid)
                 st.markdown(reply)
                 st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -214,6 +452,7 @@ with tab_weight:
                 )
                 conn.commit()
             st.success(f"Logged {w_input:.1f} {w_unit} on {w_date}")
+            st.session_state["_goto_tab"] = 2
             st.rerun()
 
     with col_chart:
@@ -269,6 +508,7 @@ with tab_weight:
                         )
                         conn.commit()
                     st.session_state.pop("editing_weight_id", None)
+                    st.session_state["_goto_tab"] = 2
                     st.rerun()
 
             # ── Edit form (shown below the table when a row is being edited) ──
@@ -300,9 +540,11 @@ with tab_weight:
                         )
                         conn.commit()
                     st.session_state.pop("editing_weight_id", None)
+                    st.session_state["_goto_tab"] = 2
                     st.rerun()
                 if cancelled:
                     st.session_state.pop("editing_weight_id", None)
+                    st.session_state["_goto_tab"] = 2
                     st.rerun()
         else:
             st.info("No weight entries yet. Log your first entry on the left!")
@@ -329,6 +571,7 @@ with tab_calories:
                     )
                     conn.commit()
                 st.success(f"Logged {meal_name}: {calories} cal")
+                st.session_state["_goto_tab"] = 3
                 st.rerun()
             else:
                 st.warning("Please enter a meal name.")
@@ -373,6 +616,7 @@ with tab_calories:
                         )
                         conn.commit()
                     st.session_state.pop("editing_cal_id", None)
+                    st.session_state["_goto_tab"] = 3
                     st.rerun()
 
             # ── Edit form ─────────────────────────────────────────────────────
@@ -400,11 +644,13 @@ with tab_calories:
                             )
                             conn.commit()
                         st.session_state.pop("editing_cal_id", None)
+                        st.session_state["_goto_tab"] = 3
                         st.rerun()
                     else:
                         st.warning("Meal name cannot be empty.")
                 if cancelled:
                     st.session_state.pop("editing_cal_id", None)
+                    st.session_state["_goto_tab"] = 3
                     st.rerun()
         else:
             st.info("No meals logged yet. Track your first meal on the left!")
@@ -418,20 +664,32 @@ with tab_planner:
     col_opts, col_plan = st.columns([1, 2])
 
     with col_opts:
+        # Default calorie target: TDEE - 500 from profile, else 1800
+        with get_conn() as _conn:
+            _lw = _conn.execute(
+                "SELECT weight_lbs FROM weight_logs WHERE user_id = ? ORDER BY date DESC LIMIT 1", (uid,)
+            ).fetchone()
+        _default_cals = (_calc_tdee(profile, _lw["weight_lbs"]) or 2300) - 500 if _lw else 1800
+        _default_cals = max(800, min(5000, _default_cals))
+
         period = st.radio("Plan for", ["Daily", "Weekly"], horizontal=True)
         calorie_target = st.number_input(
-            "Daily calorie target", min_value=800, max_value=5000, value=1800, step=50
+            "Daily calorie target", min_value=800, max_value=5000, value=_default_cals, step=50
         )
         ingredients = st.text_area(
             "Ingredients you have",
-            placeholder="e.g. chicken breast, broccoli, eggs, brown rice, olive oil, garlic…\n\nLeave blank for a general plan.",
-            height=120,
+            placeholder="e.g. chicken breast, broccoli, eggs, brown rice…  (leave blank for a general plan)",
+            height=80,
         )
         dietary_prefs = st.text_input(
-            "Dietary preferences", placeholder="e.g. vegetarian, low-carb, Mediterranean"
+            "Dietary preferences",
+            value=profile["dietary_prefs"] or "" if profile else "",
+            placeholder="e.g. vegetarian, low-carb, Mediterranean",
         )
         allergies = st.text_input(
-            "Allergies / foods to avoid", placeholder="e.g. nuts, dairy, gluten"
+            "Allergies / foods to avoid",
+            value=profile["allergies"] or "" if profile else "",
+            placeholder="e.g. nuts, dairy, gluten",
         )
 
         generate = st.button("Generate Meal Plan", type="primary")
@@ -440,20 +698,121 @@ with tab_planner:
         if generate:
             if _check_rate_limit(uid):
                 with st.spinner("Building your meal plan…"):
-                    plan = generate_meal_plan(calorie_target, period, dietary_prefs, allergies, ingredients)
+                    plan = generate_meal_plan(calorie_target, period, dietary_prefs, allergies, ingredients, profile=profile)
                 increment_usage(uid)
                 st.session_state["meal_plan"] = plan
+                st.session_state["meal_plan_period"] = period
 
         if "meal_plan" in st.session_state:
             st.markdown(st.session_state["meal_plan"])
-            st.download_button(
-                "Download plan as text",
-                data=st.session_state["meal_plan"],
-                file_name="meal_plan.txt",
-                mime="text/plain",
-            )
+            btn_col1, btn_col2 = st.columns(2)
+            with btn_col1:
+                st.download_button(
+                    "Download as text",
+                    data=st.session_state["meal_plan"],
+                    file_name="meal_plan.txt",
+                    mime="text/plain",
+                )
+            with btn_col2:
+                if st.button("Save Plan", type="primary"):
+                    save_meal_plan(uid, st.session_state.get("meal_plan_period", "Daily"),
+                                   st.session_state["meal_plan"])
+                    st.success("Plan saved to My Plans!")
         else:
             st.info("Set your preferences on the left and click **Generate Meal Plan**.")
+
+    # ── My Saved Plans ────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("My Plans")
+
+    saved_plans = get_meal_plans(uid)
+    if not saved_plans:
+        st.info("No saved plans yet. Generate a plan above and click **Save Plan**.")
+    else:
+        for plan_row in saved_plans:
+            pid         = plan_row["id"]
+            created     = plan_row["created_at"][:10]
+            plan_period = plan_row["period"]
+            label = f"{created}  —  {plan_period} plan"
+
+            with st.expander(label):
+                st.markdown(plan_row["plan_text"])
+
+                st.divider()
+                st.markdown("**Add to Planner**")
+
+                parsed = _parse_meal_plan(plan_row["plan_text"])
+                if not parsed:
+                    st.warning("Could not parse meals from this plan — try regenerating.")
+                else:
+                    add_col1, add_col2 = st.columns([1, 1])
+                    with add_col1:
+                        start_date = st.date_input(
+                            "Start date", value=date.today(), key=f"plan_date_{pid}"
+                        )
+                    with add_col2:
+                        st.write("")
+                        if st.button(f"Add {len(parsed)} meals to Planner", type="primary", key=f"add_plan_{pid}"):
+                            meals_with_dates = [
+                                {**m, "planned_date": str(start_date + pd.Timedelta(days=m["day"] - 1))}
+                                for m in parsed
+                            ]
+                            activate_meal_plan(uid, pid, meals_with_dates)
+                            st.success(f"Added {len(parsed)} meals to your Planner!")
+
+                st.divider()
+                if st.button("Delete this plan", type="secondary", key=f"del_plan_{pid}"):
+                    delete_meal_plan(pid, uid)
+                    st.session_state["_goto_tab"] = 4
+                    st.rerun()
+
+    # ── My Planner ────────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("My Planner")
+    st.caption("Meals you've scheduled — check them off as you go.")
+
+    planned = get_planned_meals(uid)
+    if not planned:
+        st.info("No meals planned yet. Use **Add to Planner** above to schedule a meal plan.")
+    else:
+        # Group by planned_date
+        from itertools import groupby
+        keyfn = lambda r: r["planned_date"]
+        for day_date, day_rows in groupby(planned, key=keyfn):
+            day_rows = list(day_rows)
+            done_count = sum(1 for r in day_rows if r["done"])
+            total_count = len(day_rows)
+            total_cal = sum(r["calories"] for r in day_rows)
+            done_cal  = sum(r["calories"] for r in day_rows if r["done"])
+
+            all_done = done_count == total_count
+            day_icon = "✅" if all_done else "🗓️"
+            day_label = f"{day_icon} {day_date}  ·  {done_count}/{total_count}  ·  {done_cal}/{total_cal} cal"
+            with st.expander(day_label, expanded=(day_date == str(date.today()))):
+                for row in day_rows:
+                    meal_id   = row["id"]
+                    is_done   = bool(row["done"])
+                    meal_text = f"**{row['meal_type']}** — {row['meal_name']} · {row['calories']} cal"
+                    c1, c2, c3 = st.columns([0.04, 0.82, 0.14])
+                    with c1:
+                        checked = st.checkbox(
+                            "", value=is_done, key=f"done_{meal_id}",
+                            label_visibility="collapsed"
+                        )
+                        if checked != is_done:
+                            mark_planned_meal_done(meal_id, uid, checked)
+                            st.session_state["_goto_tab"] = 4
+                            st.rerun()
+                    with c2:
+                        if is_done:
+                            st.markdown(f"<span style='color:grey;text-decoration:line-through'>{row['meal_type']} — {row['meal_name']} · {row['calories']} cal</span>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(meal_text)
+                    with c3:
+                        if st.button("✕", key=f"rm_meal_{meal_id}", help="Remove"):
+                            delete_planned_meal(meal_id, uid)
+                            st.session_state["_goto_tab"] = 4
+                            st.rerun()
 
 
 # ── Tab 5: Calorie Lookup ─────────────────────────────────────────────────────
@@ -482,7 +841,7 @@ with tab_scanner:
             if st.button("Analyse", type="primary", disabled=not ready):
                 if _check_rate_limit(uid):
                     with st.spinner("Estimating…"):
-                        result = analyze_food_text(food_desc.strip())
+                        result = analyze_food_text(food_desc.strip(), profile=profile)
                     increment_usage(uid)
                     _extract_scan_result(result)
 
@@ -503,7 +862,7 @@ with tab_scanner:
                     )
                     if _check_rate_limit(uid):
                         with st.spinner("Analysing your food…"):
-                            result = analyze_food_image(image_file.getvalue(), media_type)
+                            result = analyze_food_image(image_file.getvalue(), media_type, profile=profile)
                         increment_usage(uid)
                         _extract_scan_result(result)
 
