@@ -28,18 +28,79 @@ from app.services.ai import chat, generate_meal_plan, analyze_food_image, analyz
 
 init_db()
 
-st.set_page_config(page_title="NutriCoach", layout="wide")
+st.set_page_config(page_title="NutriCoach", layout="centered")
 
-# Hide the CookieManager iframe (extra-streamlit-components renders a blank component)
-# and tighten the default top padding.
 st.markdown(
     """
     <style>
+    /* Hide CookieManager iframe */
     iframe[title="extra_streamlit_components.CookieManager"] {
         display: none !important;
         height: 0 !important;
     }
-    .block-container { padding-top: 1.5rem !important; }
+
+    /* ── Base spacing ─────────────────────────────────────── */
+    .block-container {
+        padding-top: 1.25rem !important;
+        padding-left: 1rem !important;
+        padding-right: 1rem !important;
+        max-width: 860px !important;
+    }
+
+    /* ── Prevent iOS auto-zoom on input focus ─────────────── */
+    input, textarea, select,
+    [data-baseweb="input"] input,
+    [data-baseweb="textarea"] textarea,
+    [data-baseweb="select"] input {
+        font-size: 16px !important;
+    }
+
+    /* ── Larger tap targets for buttons ───────────────────── */
+    .stButton > button {
+        min-height: 44px !important;
+        font-size: 15px !important;
+    }
+
+    /* ── Scrollable tab bar (no overflow clip) ────────────── */
+    [data-baseweb="tab-list"] {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch !important;
+        scrollbar-width: none !important;
+        flex-wrap: nowrap !important;
+        gap: 2px !important;
+    }
+    [data-baseweb="tab-list"]::-webkit-scrollbar { display: none; }
+    [data-baseweb="tab"] {
+        white-space: nowrap !important;
+        padding: 10px 14px !important;
+        font-size: 14px !important;
+    }
+
+    /* ── Stack columns on small screens ──────────────────── */
+    @media (max-width: 640px) {
+        .block-container {
+            padding-left: 0.5rem !important;
+            padding-right: 0.5rem !important;
+        }
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+        }
+        [data-testid="column"] {
+            width: 100% !important;
+            flex: 1 1 100% !important;
+            min-width: 100% !important;
+        }
+        /* Keep 2-button rows side by side */
+        [data-testid="column"]:has(> div > [data-testid="stButton"]:only-child) {
+            flex: 1 1 45% !important;
+            min-width: 45% !important;
+        }
+        .stMetric { font-size: 13px; }
+        [data-baseweb="tab"] {
+            padding: 8px 10px !important;
+            font-size: 13px !important;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -281,7 +342,7 @@ if "_goto_tab" in st.session_state:
 profile = get_profile(uid)
 
 tab_profile, tab_ai, tab_weight, tab_calories, tab_planner, tab_scanner = st.tabs(
-    ["My Profile", "AI Coach", "Weight Tracker", "Calorie Log", "Meal Planner", "Calorie Lookup"]
+    ["Profile", "AI Coach", "Weight", "Calories", "Meal Plan", "Scanner"]
 )
 
 
