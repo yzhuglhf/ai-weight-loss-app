@@ -134,6 +134,20 @@ def _verify_password(password: str, stored: str) -> bool:
 
 # ── User helpers ──────────────────────────────────────────────────────────────
 
+def get_or_create_default_user() -> int:
+    """Return the single app user's id, creating it if the table is empty."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT id FROM users LIMIT 1").fetchone()
+        if row:
+            return row["id"]
+        cur = conn.execute(
+            "INSERT INTO users (email, password_hash) VALUES (?, ?)",
+            ("owner@local", "no-auth"),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
 def get_user_by_email(email: str):
     with get_conn() as conn:
         return conn.execute(

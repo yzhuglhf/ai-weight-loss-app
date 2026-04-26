@@ -25,7 +25,13 @@ SYSTEM_PROMPT = """You are NutriCoach, a supportive AI weight loss coach. You he
 - Workout plans tailored to fitness level
 - Practical weight loss tips and motivation
 
-Keep responses concise and actionable. For food suggestions always include approximate calories.
+Always format responses using markdown:
+- Use **bold** for key numbers, food names, and action items
+- Use bullet lists for multiple options or tips
+- Use ### headers to separate distinct sections when the response has more than one topic
+- Keep responses concise and actionable
+
+For food suggestions always include approximate calories in bold, e.g. **~350 cal**.
 For workouts include duration and estimated calories burned."""
 
 _NUTRITION_FORMAT = (
@@ -74,14 +80,38 @@ def _build_system(profile) -> list[dict]:
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
-def chat(messages: list[dict], profile=None) -> str:
+def chat(messages: list[dict], profile=None, today_stats: str = "") -> str:
+    system = _build_system(profile)
+    if today_stats:
+        system[0]["text"] += f"\n\n{today_stats}"
     response = client.messages.create(
         model=CHAT_MODEL,
         max_tokens=1024,
-        system=_build_system(profile),
+        system=system,
         messages=messages,
     )
     return response.content[0].text
+
+
+def estimate_calories(description: str, profile=None) -> int:
+    """Return just the calorie count as an integer — fast single-number response."""
+    ctx = _profile_context(profile)
+    prefix = f"{ctx}\n\n" if ctx else ""
+    response = client.messages.create(
+        model=CHAT_MODEL,
+        max_tokens=32,
+        messages=[{
+            "role": "user",
+            "content": (
+                f"{prefix}I ate: {description}\n\n"
+                "Reply with ONLY a single integer — your best estimate of the total calories. "
+                "No words, no units, just the number."
+            ),
+        }],
+    )
+    import re as _re
+    nums = _re.findall(r"\d+", response.content[0].text)
+    return int(nums[0]) if nums else 0
 
 
 def analyze_food_text(description: str, profile=None) -> str:

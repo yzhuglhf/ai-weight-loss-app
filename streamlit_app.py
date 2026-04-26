@@ -1,4 +1,3 @@
-import hmac
 import os
 import re
 import sys
@@ -6,7 +5,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-import extra_streamlit_components as stx
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -17,14 +15,13 @@ load_dotenv()
 
 from app.db import (
     init_db, get_conn,
-    authenticate, create_user, get_user_by_email,
-    create_session, get_session_user, delete_session,
+    get_or_create_default_user,
     get_usage_today, increment_usage,
     get_profile, save_profile,
-    save_meal_plan, get_meal_plans, update_meal_plan, delete_meal_plan,
-    activate_meal_plan, get_planned_meals, mark_planned_meal_done, update_planned_meal, delete_planned_meal,
+    save_meal_plan,
+    activate_meal_plan, get_planned_meals, mark_planned_meal_done,
 )
-from app.services.ai import chat, generate_meal_plan, analyze_food_image, analyze_food_text
+from app.services.ai import chat, generate_meal_plan, analyze_food_image, analyze_food_text, estimate_calories
 
 init_db()
 
@@ -106,8 +103,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-COOKIE_NAME = "wl_session"
-INVITE_CODE = os.getenv("INVITE_CODE", "")
 DAILY_AI_LIMIT = int(os.getenv("DAILY_AI_LIMIT", "20"))
 
 
@@ -240,88 +235,38 @@ def _bmi_label(bmi: float) -> str:
     return "Obese"
 
 
-cookie_manager = stx.CookieManager()
-
-
-# ── Restore session from cookie on refresh ────────────────────────────────────
+# ── Auto-login (auth disabled for private use) ────────────────────────────────
 if not st.session_state.get("user_id"):
-    token = cookie_manager.get(COOKIE_NAME)
-    if token:
-        user = get_session_user(token)
-        if user:
-            st.session_state["user_id"] = user["id"]
-            st.session_state["user_email"] = user["email"]
-            st.session_state["session_token"] = token
-
-
-# ── Auth gate ─────────────────────────────────────────────────────────────────
-if not st.session_state.get("user_id"):
-    st.title("NutriCoach")
-
-    tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
-
-    with tab_login:
-        with st.form("login_form"):
-            li_email = st.text_input("Email")
-            li_password = st.text_input("Password", type="password")
-            li_submit = st.form_submit_button("Log in", type="primary")
-        if li_submit:
-            user = authenticate(li_email, li_password)
-            if user:
-                token = create_session(user["id"])
-                cookie_manager.set(COOKIE_NAME, token)
-                st.session_state["user_id"] = user["id"]
-                st.session_state["user_email"] = user["email"]
-                st.session_state["session_token"] = token
-                st.rerun()
-            else:
-                st.error("Invalid email or password.")
-
-    with tab_signup:
-        with st.form("signup_form"):
-            su_email = st.text_input("Email", key="su_email")
-            su_password = st.text_input("Password", type="password", key="su_pw")
-            su_confirm = st.text_input("Confirm password", type="password", key="su_confirm")
-            if INVITE_CODE:
-                su_invite = st.text_input("Invite code", key="su_invite")
-            su_submit = st.form_submit_button("Create account", type="primary")
-        if su_submit:
-            invite_ok = (not INVITE_CODE) or hmac.compare_digest(
-                su_invite.strip(), INVITE_CODE
-            )
-            if not su_email or not su_password:
-                st.error("Email and password are required.")
-            elif not invite_ok:
-                st.error("Invalid invite code.")
-            elif su_password != su_confirm:
-                st.error("Passwords don't match.")
-            elif len(su_password) < 8:
-                st.error("Password must be at least 8 characters.")
-            elif get_user_by_email(su_email):
-                st.error("An account with that email already exists.")
-            else:
-                create_user(su_email, su_password)
-                st.success("Account created! Switch to the Log in tab.")
-
-    st.stop()
+    st.session_state["user_id"] = get_or_create_default_user()
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 uid = st.session_state["user_id"]
+profile = get_profile(uid)
 
 with st.sidebar:
-    st.markdown(f"**{st.session_state['user_email']}**")
+    # Today's calorie progress
+    with get_conn() as _sb:
+        _sb_cal = (_sb.execute(
+            "SELECT COALESCE(SUM(calories),0) FROM calorie_logs WHERE user_id=? AND date=?",
+            (uid, str(date.today()))
+        ).fetchone()[0])
+    with get_conn() as _sbw:
+        _sbw_lw = _sbw.execute(
+            "SELECT weight_lbs FROM weight_logs WHERE user_id=? ORDER BY date DESC LIMIT 1", (uid,)
+        ).fetchone()
+    _sb_target = ((_calc_tdee(profile, _sbw_lw["weight_lbs"]) or 2300) - 500) if (_sbw_lw and profile) else None
+    if _sb_target:
+        _sb_remaining = _sb_target - _sb_cal
+        _sb_label = f"✅ {_sb_remaining} cal left" if _sb_remaining >= 0 else f"⚠️ {abs(_sb_remaining)} cal over"
+        st.caption(f"Today: {_sb_cal:,} / {_sb_target:,} cal — {_sb_label}")
+        st.progress(min(_sb_cal / _sb_target, 1.0))
+    elif _sb_cal:
+        st.caption(f"Today: {_sb_cal:,} cal logged")
+
     used_today = get_usage_today(uid)
     st.caption(f"AI requests today: {used_today} / {DAILY_AI_LIMIT}")
     st.progress(min(used_today / DAILY_AI_LIMIT, 1.0))
-    if st.button("Log out"):
-        token = st.session_state.get("session_token")
-        if token:
-            delete_session(token)
-            cookie_manager.delete(COOKIE_NAME)
-        for key in ["user_id", "user_email", "session_token", "messages", "meal_plan", "scan_result", "scan_calories"]:
-            st.session_state.pop(key, None)
-        st.rerun()
 
 st.title("NutriCoach")
 
@@ -338,11 +283,8 @@ if "_goto_tab" in st.session_state:
         height=0,
     )
 
-# Load profile once per render — used by all tabs
-profile = get_profile(uid)
-
-tab_profile, tab_ai, tab_weight, tab_calories, tab_planner, tab_scanner = st.tabs(
-    ["Profile", "AI Coach", "Weight", "Calories", "Meal Plan", "Scanner"]
+tab_ai, tab_calories, tab_weight, tab_planner, tab_scanner, tab_profile = st.tabs(
+    ["AI Coach", "Calories", "Weight", "Meal Plan", "Scanner", "Profile"]
 )
 
 
@@ -424,7 +366,7 @@ with tab_profile:
             )
             st.success("Profile saved!")
             profile = get_profile(uid)
-            st.session_state["_goto_tab"] = 0
+            st.session_state["_goto_tab"] = 5
             st.rerun()
 
     with col_stats:
@@ -460,19 +402,120 @@ with tab_profile:
             st.info("Log your weight and complete your profile to see personalised stats here.")
 
 
-# ── Tab 2: AI Chat ────────────────────────────────────────────────────────────
+# ── Tab 1: AI Coach ───────────────────────────────────────────────────────────
 with tab_ai:
-    st.subheader("Chat with your AI Coach")
-    st.caption("Ask about meals, workouts, calorie estimates, or weight loss tips.")
+    # Compute today's calorie context for the AI
+    with get_conn() as _ac:
+        _ai_cal_today = _ac.execute(
+            "SELECT COALESCE(SUM(calories),0) FROM calorie_logs WHERE user_id=? AND date=?",
+            (uid, str(date.today()))
+        ).fetchone()[0]
+    with get_conn() as _aw:
+        _aw_lw = _aw.execute(
+            "SELECT weight_lbs FROM weight_logs WHERE user_id=? ORDER BY date DESC LIMIT 1", (uid,)
+        ).fetchone()
+    _ai_target = ((_calc_tdee(profile, _aw_lw["weight_lbs"]) or 2300) - 500) if (_aw_lw and profile) else None
+    _ai_remaining = (_ai_target - _ai_cal_today) if _ai_target else None
+
+    today_stats_str = ""
+    if _ai_target:
+        today_stats_str = (
+            f"Today's nutrition snapshot: {_ai_cal_today} cal logged, "
+            f"daily target {_ai_target} cal, "
+            f"{_ai_remaining} cal remaining."
+        )
+    elif _ai_cal_today:
+        today_stats_str = f"Today's nutrition snapshot: {_ai_cal_today} cal logged so far."
+
+    # Header row with clear button
+    hdr_col, btn_col = st.columns([3, 1])
+    name_str = (profile["name"] + "!" if profile and profile["name"] else "")
+    hdr_col.subheader(f"Hi {name_str} I'm your AI Coach" if name_str else "AI Coach")
+    if btn_col.button("Clear chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+    if today_stats_str:
+        st.caption(today_stats_str)
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
+    # Handle quick prompt from buttons (set before rerun, processed here)
+    pending_prompt = st.session_state.pop("quick_prompt", None)
+    if pending_prompt:
+        st.session_state.messages.append({"role": "user", "content": pending_prompt})
+
+    # Quick-action prompts — shown only when conversation is fresh
+    if not st.session_state.messages:
+        st.markdown("**Quick actions — tap to ask:**")
+        qp1, qp2 = st.columns(2)
+        _prefs = profile["dietary_prefs"] if profile and profile["dietary_prefs"] else ""
+        _goal_lbs = profile["goal_weight_lbs"] if profile and profile["goal_weight_lbs"] else None
+
+        with qp1:
+            if _ai_remaining is not None and _ai_remaining >= 0:
+                _btn1_label = f"What can I eat? ({_ai_remaining:,} cal left)"
+                _btn1_prompt = (
+                    f"I have {_ai_remaining} calories left today "
+                    f"(logged {_ai_cal_today} cal, target {_ai_target} cal). "
+                    "Suggest 3 specific meal or snack options that fit my remaining budget, "
+                    "with calorie counts for each."
+                )
+            else:
+                _btn1_label = "Suggest a healthy meal"
+                _btn1_prompt = "Suggest 3 healthy, balanced meal options with approximate calories for each."
+            if st.button(_btn1_label, use_container_width=True):
+                st.session_state["quick_prompt"] = _btn1_prompt
+                st.rerun()
+
+            if st.button("Healthy snack ideas", use_container_width=True):
+                st.session_state["quick_prompt"] = (
+                    f"Give me 5 healthy snack ideas under 200 calories each"
+                    f"{', fitting ' + _prefs + ' preferences' if _prefs else ''}. "
+                    "Include the approximate calories for each."
+                )
+                st.rerun()
+
+        with qp2:
+            if st.button("How am I progressing?", use_container_width=True):
+                _wt_str = f"My current weight is {round(_aw_lw['weight_lbs'], 1)} lbs. " if _aw_lw else ""
+                _goal_str = f"My goal weight is {_goal_lbs:.1f} lbs. " if _goal_lbs else ""
+                st.session_state["quick_prompt"] = (
+                    f"{_wt_str}{_goal_str}"
+                    "Based on my profile and goals, give me an honest progress check "
+                    "and 2-3 specific, actionable tips I can act on this week."
+                )
+                st.rerun()
+
+            if st.button("Plan tomorrow's meals", use_container_width=True):
+                _t = str(_ai_target) if _ai_target else "1800"
+                st.session_state["quick_prompt"] = (
+                    f"Help me plan tomorrow's meals targeting {_t} calories"
+                    f"{'. Preferences: ' + _prefs if _prefs else ''}. "
+                    "Give me breakfast, lunch, dinner, and a snack with approximate calories for each. "
+                    "Keep it realistic and practical."
+                )
+                st.rerun()
+
+        st.divider()
+
+    # Render chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    if prompt := st.chat_input("e.g. Suggest a low-carb dinner under 500 calories…"):
+    # Auto-respond to a pending quick prompt
+    if pending_prompt:
+        with st.chat_message("assistant"):
+            if _check_rate_limit(uid):
+                with st.spinner("Thinking…"):
+                    reply = chat(st.session_state.messages, profile=profile, today_stats=today_stats_str)
+                increment_usage(uid)
+                st.markdown(reply)
+                st.session_state.messages.append({"role": "assistant", "content": reply})
+
+    if prompt := st.chat_input("Ask me anything about food, weight loss, or workouts…"):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -480,7 +523,7 @@ with tab_ai:
         with st.chat_message("assistant"):
             if _check_rate_limit(uid):
                 with st.spinner("Thinking…"):
-                    reply = chat(st.session_state.messages, profile=profile)
+                    reply = chat(st.session_state.messages, profile=profile, today_stats=today_stats_str)
                 increment_usage(uid)
                 st.markdown(reply)
                 st.session_state.messages.append({"role": "assistant", "content": reply})
@@ -548,20 +591,19 @@ with tab_weight:
 
             # ── Inline table with Edit / Delete per row ───────────────────────
             sorted_df = df.sort_values("Date", ascending=False).reset_index(drop=True)
-            h = st.columns([2, 2, 3, 1, 1])
-            for col, label in zip(h, ["Date", f"Weight ({w_unit})", "Notes", "Edit", "Delete"]):
+            h = st.columns([3, 3, 1, 1])
+            for col, label in zip(h, ["Date", f"Weight ({w_unit})", "", ""]):
                 col.markdown(f"**{label}**")
             st.divider()
 
             for _, row in sorted_df.iterrows():
                 row_id = int(row["ID"])
-                c = st.columns([2, 2, 3, 1, 1])
+                c = st.columns([3, 3, 1, 1])
                 c[0].write(row["Date"].strftime("%Y-%m-%d"))
                 c[1].write(f"{row[display_col]:.1f}")
-                c[2].write(row["Notes"] or "—")
-                if c[3].button("Edit", key=f"ew_open_{row_id}"):
+                if c[2].button("✏️", key=f"ew_open_{row_id}", help="Edit"):
                     st.session_state["editing_weight_id"] = row_id
-                if c[4].button("Delete", key=f"ew_del_{row_id}"):
+                if c[3].button("✕", key=f"ew_del_{row_id}", help="Delete"):
                     with get_conn() as conn:
                         conn.execute(
                             "DELETE FROM weight_logs WHERE id = ? AND user_id = ?",
@@ -611,15 +653,90 @@ with tab_weight:
             st.info("No weight entries yet. Log your first entry on the left!")
 
 
-# ── Tab 3: Calorie Log ────────────────────────────────────────────────────────
+# ── Tab 2: Calorie Log ────────────────────────────────────────────────────────
 with tab_calories:
     st.subheader("Track Your Calories")
 
+    # Daily goal progress bar
+    with get_conn() as _cg:
+        _cg_today = _cg.execute(
+            "SELECT COALESCE(SUM(calories),0) FROM calorie_logs WHERE user_id=? AND date=?",
+            (uid, str(date.today()))
+        ).fetchone()[0]
+    with get_conn() as _cgw:
+        _cgw_lw = _cgw.execute(
+            "SELECT weight_lbs FROM weight_logs WHERE user_id=? ORDER BY date DESC LIMIT 1", (uid,)
+        ).fetchone()
+    _cg_target = ((_calc_tdee(profile, _cgw_lw["weight_lbs"]) or 2300) - 500) if (_cgw_lw and profile) else None
+
+    if _cg_target:
+        _cg_remaining = _cg_target - _cg_today
+        cg1, cg2, cg3 = st.columns(3)
+        cg1.metric("Eaten today", f"{_cg_today:,} cal")
+        cg2.metric("Daily target", f"{_cg_target:,} cal")
+        if _cg_remaining >= 0:
+            cg3.metric("Remaining", f"{_cg_remaining:,} cal")
+        else:
+            cg3.metric("Over target", f"{abs(_cg_remaining):,} cal")
+        st.progress(min(_cg_today / _cg_target, 1.0))
+        if _cg_remaining < 0:
+            st.warning(f"You're {abs(_cg_remaining):,} cal over your daily target.")
+        elif _cg_remaining <= 300:
+            st.info(f"Only {_cg_remaining:,} cal left — choose your next meal carefully.")
+    else:
+        st.metric("Eaten today", f"{_cg_today:,} cal")
+        if not profile:
+            st.caption("Complete your Profile to see your daily calorie target here.")
+
+    st.divider()
     col_form, col_chart = st.columns([1, 2])
 
     with col_form:
+        # Quick-add from history
+        with get_conn() as _qc:
+            _frequent = _qc.execute(
+                """SELECT meal_name, ROUND(AVG(calories)) as avg_cal, COUNT(*) as cnt
+                   FROM calorie_logs WHERE user_id=?
+                   GROUP BY meal_name ORDER BY cnt DESC LIMIT 6""",
+                (uid,)
+            ).fetchall()
+        if _frequent:
+            st.caption("**Quick add:**")
+            for _fm in _frequent:
+                _fc = int(_fm["avg_cal"])
+                if st.button(f"{_fm['meal_name']}  ·  {_fc} cal", key=f"qa_{_fm['meal_name']}", use_container_width=True):
+                    with get_conn() as _qconn:
+                        _qconn.execute(
+                            "INSERT INTO calorie_logs (user_id, date, meal_name, calories, notes) VALUES (?, ?, ?, ?, ?)",
+                            (uid, str(date.today()), _fm["meal_name"], _fc, ""),
+                        )
+                        _qconn.commit()
+                    st.success(f"Logged {_fm['meal_name']}: {_fc} cal")
+                    st.session_state["_goto_tab"] = 1
+                    st.rerun()
+            st.divider()
+
+        st.caption("**Log a meal:**")
         c_date = st.date_input("Date", value=date.today(), key="c_date")
-        meal_name = st.text_input("Food / Meal", key="c_meal")
+        meal_name = st.text_input(
+            "Food / Meal",
+            key="c_meal",
+            placeholder="e.g. 2 scrambled eggs with toast",
+        )
+
+        _meal_typed = st.session_state.get("c_meal", "").strip()
+        if st.button("Estimate calories with AI", disabled=not _meal_typed, use_container_width=True):
+            if _check_rate_limit(uid):
+                with st.spinner("Estimating…"):
+                    _est = estimate_calories(_meal_typed, profile=profile)
+                increment_usage(uid)
+                st.session_state["c_cals"] = _est
+                st.session_state["_cal_est_label"] = f"AI estimated **{_est} cal** for \"{_meal_typed}\""
+                st.rerun()
+
+        if "_cal_est_label" in st.session_state:
+            st.caption(st.session_state["_cal_est_label"])
+
         calories = st.number_input("Calories", min_value=0, max_value=5000, step=5, key="c_cals")
         c_notes = st.text_input("Notes (optional)", key="c_notes")
 
@@ -631,8 +748,9 @@ with tab_calories:
                         (uid, str(c_date), meal_name.strip(), calories, c_notes),
                     )
                     conn.commit()
+                st.session_state.pop("_cal_est_label", None)
                 st.success(f"Logged {meal_name}: {calories} cal")
-                st.session_state["_goto_tab"] = 3
+                st.session_state["_goto_tab"] = 1
                 st.rerun()
             else:
                 st.warning("Please enter a meal name.")
@@ -648,28 +766,24 @@ with tab_calories:
             df = pd.DataFrame(rows, columns=["ID", "Date", "Meal", "Calories", "Notes"])
             df["Date"] = pd.to_datetime(df["Date"])
 
-            today_total = df[df["Date"].dt.date == date.today()]["Calories"].sum()
-            st.metric("Today's Calories", f"{today_total} cal")
-
             daily = df.groupby("Date")["Calories"].sum().reset_index()
             st.bar_chart(daily.set_index("Date"))
 
             # ── Inline table with Edit / Delete per row ───────────────────────
-            h = st.columns([2, 3, 1, 2, 1, 1])
-            for col, label in zip(h, ["Date", "Meal", "Cal", "Notes", "Edit", "Delete"]):
+            h = st.columns([2, 5, 1, 1, 1])
+            for col, label in zip(h, ["Date", "Meal", "Cal", "", ""]):
                 col.markdown(f"**{label}**")
             st.divider()
 
             for _, row in df.iterrows():
                 row_id = int(row["ID"])
-                c = st.columns([2, 3, 1, 2, 1, 1])
-                c[0].write(row["Date"].strftime("%Y-%m-%d"))
+                c = st.columns([2, 5, 1, 1, 1])
+                c[0].write(row["Date"].strftime("%m/%d"))
                 c[1].write(row["Meal"])
                 c[2].write(str(row["Calories"]))
-                c[3].write(row["Notes"] or "—")
-                if c[4].button("Edit", key=f"ec_open_{row_id}"):
+                if c[3].button("✏️", key=f"ec_open_{row_id}", help="Edit"):
                     st.session_state["editing_cal_id"] = row_id
-                if c[5].button("Delete", key=f"ec_del_{row_id}"):
+                if c[4].button("✕", key=f"ec_del_{row_id}", help="Delete"):
                     with get_conn() as conn:
                         conn.execute(
                             "DELETE FROM calorie_logs WHERE id = ? AND user_id = ?",
@@ -677,7 +791,7 @@ with tab_calories:
                         )
                         conn.commit()
                     st.session_state.pop("editing_cal_id", None)
-                    st.session_state["_goto_tab"] = 3
+                    st.session_state["_goto_tab"] = 1
                     st.rerun()
 
             # ── Edit form ─────────────────────────────────────────────────────
@@ -705,13 +819,13 @@ with tab_calories:
                             )
                             conn.commit()
                         st.session_state.pop("editing_cal_id", None)
-                        st.session_state["_goto_tab"] = 3
+                        st.session_state["_goto_tab"] = 1
                         st.rerun()
                     else:
                         st.warning("Meal name cannot be empty.")
                 if cancelled:
                     st.session_state.pop("editing_cal_id", None)
-                    st.session_state["_goto_tab"] = 3
+                    st.session_state["_goto_tab"] = 1
                     st.rerun()
         else:
             st.info("No meals logged yet. Track your first meal on the left!")
@@ -719,223 +833,161 @@ with tab_calories:
 
 # ── Tab 4: Meal Planner ───────────────────────────────────────────────────────
 with tab_planner:
-    st.subheader("AI Meal Planner")
-    st.caption("Generate a personalised meal plan based on your calorie target.")
+    from itertools import groupby as _groupby
 
-    col_opts, col_plan = st.columns([1, 2])
+    all_planned = get_planned_meals(uid)
+    today_str   = str(date.today())
+    today_meals  = [m for m in all_planned if m["planned_date"] == today_str]
+    future_meals = [m for m in all_planned if m["planned_date"] > today_str]
 
-    with col_opts:
-        # Default calorie target: TDEE - 500 from profile, else 1800
-        with get_conn() as _conn:
-            _lw = _conn.execute(
-                "SELECT weight_lbs FROM weight_logs WHERE user_id = ? ORDER BY date DESC LIMIT 1", (uid,)
-            ).fetchone()
-        _default_cals = (_calc_tdee(profile, _lw["weight_lbs"]) or 2300) - 500 if _lw else 1800
-        _default_cals = max(800, min(5000, _default_cals))
-
-        period = st.radio("Plan for", ["Daily", "Weekly"], horizontal=True)
-        calorie_target = st.number_input(
-            "Daily calorie target", min_value=800, max_value=5000, value=_default_cals, step=50
+    # ── Today's meals ─────────────────────────────────────────────────────────
+    if today_meals:
+        total_plan_cal = sum(m["calories"] for m in today_meals)
+        done_plan_cal  = sum(m["calories"] for m in today_meals if m["done"])
+        done_plan_cnt  = sum(1 for m in today_meals if m["done"])
+        st.markdown(
+            f"### Today &nbsp; · &nbsp; {done_plan_cnt}/{len(today_meals)} meals "
+            f"&nbsp; · &nbsp; {done_plan_cal:,} / {total_plan_cal:,} cal"
         )
-        ingredients = st.text_area(
-            "Ingredients you have",
-            placeholder="e.g. chicken breast, broccoli, eggs, brown rice…  (leave blank for a general plan)",
-            height=80,
-        )
-        dietary_prefs = st.text_input(
-            "Dietary preferences",
-            value=profile["dietary_prefs"] or "" if profile else "",
-            placeholder="e.g. vegetarian, low-carb, Mediterranean",
-        )
-        allergies = st.text_input(
-            "Allergies / foods to avoid",
-            value=profile["allergies"] or "" if profile else "",
-            placeholder="e.g. nuts, dairy, gluten",
-        )
+        st.progress(min(done_plan_cal / total_plan_cal, 1.0) if total_plan_cal else 0.0)
 
-        generate = st.button("Generate Meal Plan", type="primary")
-
-    with col_plan:
-        if generate:
-            if _check_rate_limit(uid):
-                with st.spinner("Building your meal plan…"):
-                    plan = generate_meal_plan(calorie_target, period, dietary_prefs, allergies, ingredients, profile=profile)
-                increment_usage(uid)
-                st.session_state["meal_plan"] = plan
-                st.session_state["meal_plan_period"] = period
-
-        if "meal_plan" in st.session_state:
-            st.markdown(st.session_state["meal_plan"])
-            btn_col1, btn_col2 = st.columns(2)
-            with btn_col1:
-                st.download_button(
-                    "Download as text",
-                    data=st.session_state["meal_plan"],
-                    file_name="meal_plan.txt",
-                    mime="text/plain",
-                )
-            with btn_col2:
-                if st.button("Save Plan", type="primary"):
-                    save_meal_plan(uid, st.session_state.get("meal_plan_period", "Daily"),
-                                   st.session_state["meal_plan"])
-                    st.success("Plan saved to My Plans!")
-        else:
-            st.info("Set your preferences on the left and click **Generate Meal Plan**.")
-
-    # ── My Saved Plans ────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("My Plans")
-
-    saved_plans = get_meal_plans(uid)
-    if not saved_plans:
-        st.info("No saved plans yet. Generate a plan above and click **Save Plan**.")
-    else:
-        for plan_row in saved_plans:
-            pid         = plan_row["id"]
-            created     = plan_row["created_at"][:10]
-            plan_period = plan_row["period"]
-            label = f"{created}  —  {plan_period} plan"
-
-            with st.expander(label):
-                editing_plan = st.session_state.get("editing_plan_id") == pid
-
-                if editing_plan:
-                    new_text = st.text_area(
-                        "Edit plan text",
-                        value=plan_row["plan_text"],
-                        height=300,
-                        key=f"edit_plan_text_{pid}",
+        for _m in today_meals:
+            _mid    = _m["id"]
+            _done   = bool(_m["done"])
+            tc1, tc2, tc3 = st.columns([0.07, 0.73, 0.20])
+            with tc1:
+                _checked = st.checkbox("", value=_done, key=f"tp_{_mid}", label_visibility="collapsed")
+                if _checked != _done:
+                    mark_planned_meal_done(_mid, uid, _checked)
+                    if _checked:
+                        with get_conn() as _pc:
+                            _pc.execute(
+                                "INSERT INTO calorie_logs (user_id, date, meal_name, calories, notes)"
+                                " VALUES (?, ?, ?, ?, ?)",
+                                (uid, today_str, _m["meal_name"], _m["calories"], "from plan"),
+                            )
+                            _pc.commit()
+                    st.session_state["_goto_tab"] = 3
+                    st.rerun()
+            with tc2:
+                if _done:
+                    st.markdown(
+                        f"<span style='color:grey;text-decoration:line-through'>"
+                        f"{_m['meal_type']} — {_m['meal_name']}</span>",
+                        unsafe_allow_html=True,
                     )
-                    ep_col1, ep_col2 = st.columns(2)
-                    if ep_col1.button("Save changes", type="primary", key=f"ep_save_{pid}"):
-                        update_meal_plan(pid, uid, new_text.strip())
-                        st.session_state.pop("editing_plan_id", None)
-                        st.session_state["_goto_tab"] = 4
-                        st.rerun()
-                    if ep_col2.button("Cancel", key=f"ep_cancel_{pid}"):
-                        st.session_state.pop("editing_plan_id", None)
-                        st.session_state["_goto_tab"] = 4
-                        st.rerun()
                 else:
-                    st.markdown(plan_row["plan_text"])
+                    st.markdown(f"**{_m['meal_type']}** — {_m['meal_name']}")
+            with tc3:
+                st.write(f"{_m['calories']:,} cal")
 
-                    st.divider()
-                    act_col1, act_col2, act_col3 = st.columns([1, 1, 1])
-
-                    with act_col1:
-                        if act_col1.button("✏️ Edit plan", key=f"ep_open_{pid}"):
-                            st.session_state["editing_plan_id"] = pid
-                            st.session_state["_goto_tab"] = 4
-                            st.rerun()
-
-                    parsed = _parse_meal_plan(plan_row["plan_text"])
-                    if parsed:
-                        with act_col2:
-                            start_date = st.date_input(
-                                "Start date", value=date.today(), key=f"plan_date_{pid}"
-                            )
-                        with act_col3:
-                            st.write("")
-                            if st.button(f"Add {len(parsed)} meals →", type="primary", key=f"add_plan_{pid}"):
-                                meals_with_dates = [
-                                    {**m, "planned_date": str(start_date + pd.Timedelta(days=m["day"] - 1))}
-                                    for m in parsed
-                                ]
-                                activate_meal_plan(uid, pid, meals_with_dates)
-                                st.success(f"Added {len(parsed)} meals to your Planner!")
-                    else:
-                        with act_col2:
-                            st.warning("Could not parse meals — try editing the plan text.")
-
-                    st.divider()
-                    if st.button("Delete this plan", type="secondary", key=f"del_plan_{pid}"):
-                        delete_meal_plan(pid, uid)
-                        st.session_state["_goto_tab"] = 4
-                        st.rerun()
-
-    # ── My Planner ────────────────────────────────────────────────────────────
-    st.divider()
-    st.subheader("My Planner")
-    st.caption("Meals you've scheduled — check them off as you go.")
-
-    planned = get_planned_meals(uid)
-    if not planned:
-        st.info("No meals planned yet. Use **Add to Planner** above to schedule a meal plan.")
+        st.divider()
+    elif all_planned:
+        st.info("All meals for today are done. Generate a new plan below when ready.")
     else:
-        # Group by planned_date
-        from itertools import groupby
-        keyfn = lambda r: r["planned_date"]
-        for day_date, day_rows in groupby(planned, key=keyfn):
-            day_rows = list(day_rows)
-            done_count = sum(1 for r in day_rows if r["done"])
-            total_count = len(day_rows)
-            total_cal = sum(r["calories"] for r in day_rows)
-            done_cal  = sum(r["calories"] for r in day_rows if r["done"])
+        st.info("No plan yet — generate one below and hit **Start today**.")
 
-            all_done = done_count == total_count
-            day_icon = "✅" if all_done else "🗓️"
-            day_label = f"{day_icon} {day_date}  ·  {done_count}/{total_count}  ·  {done_cal}/{total_cal} cal"
-            with st.expander(day_label, expanded=(day_date == str(date.today()))):
-                for row in day_rows:
-                    meal_id   = row["id"]
-                    is_done   = bool(row["done"])
-                    meal_text = f"**{row['meal_type']}** — {row['meal_name']} · {row['calories']} cal"
-                    editing_this = st.session_state.get("editing_planned_id") == meal_id
+    # ── Upcoming days (collapsed) ─────────────────────────────────────────────
+    if future_meals:
+        _future_days = sorted(set(m["planned_date"] for m in future_meals))
+        with st.expander(f"Upcoming — {len(_future_days)} day(s)"):
+            for _fday, _frows in _groupby(future_meals, key=lambda r: r["planned_date"]):
+                _frows = list(_frows)
+                _fday_cal = sum(r["calories"] for r in _frows)
+                st.markdown(f"**{_fday}** — {_fday_cal:,} cal")
+                for _fr in _frows:
+                    _fc1, _fc2 = st.columns([4, 1])
+                    _fc1.write(f"{_fr['meal_type']} — {_fr['meal_name']}")
+                    _fc2.write(f"{_fr['calories']:,} cal")
+        st.divider()
 
-                    c1, c2, c3, c4 = st.columns([0.04, 0.72, 0.12, 0.12])
-                    with c1:
-                        checked = st.checkbox(
-                            "", value=is_done, key=f"done_{meal_id}",
-                            label_visibility="collapsed"
-                        )
-                        if checked != is_done:
-                            mark_planned_meal_done(meal_id, uid, checked)
-                            st.session_state["_goto_tab"] = 4
-                            st.rerun()
-                    with c2:
-                        if is_done:
-                            st.markdown(f"<span style='color:grey;text-decoration:line-through'>{row['meal_type']} — {row['meal_name']} · {row['calories']} cal</span>", unsafe_allow_html=True)
-                        else:
-                            st.markdown(meal_text)
-                    with c3:
-                        if st.button("✏️", key=f"edit_meal_{meal_id}", help="Edit"):
-                            if editing_this:
-                                st.session_state.pop("editing_planned_id", None)
-                            else:
-                                st.session_state["editing_planned_id"] = meal_id
-                            st.session_state["_goto_tab"] = 4
-                            st.rerun()
-                    with c4:
-                        if st.button("✕", key=f"rm_meal_{meal_id}", help="Remove"):
-                            delete_planned_meal(meal_id, uid)
-                            st.session_state.pop("editing_planned_id", None)
-                            st.session_state["_goto_tab"] = 4
-                            st.rerun()
+    # ── Generate new plan ─────────────────────────────────────────────────────
+    st.markdown("### Generate a New Plan")
 
-                    if editing_this:
-                        with st.form(key=f"edit_meal_form_{meal_id}"):
-                            ef_col1, ef_col2, ef_col3 = st.columns([1, 2, 1])
-                            e_type = ef_col1.selectbox(
-                                "Type",
-                                ["Breakfast", "Lunch", "Dinner", "Snacks", "Other"],
-                                index=["Breakfast","Lunch","Dinner","Snacks","Other"].index(row["meal_type"])
-                                      if row["meal_type"] in ["Breakfast","Lunch","Dinner","Snacks","Other"] else 4,
-                                key=f"ef_type_{meal_id}",
-                            )
-                            e_name = ef_col2.text_input("Meal", value=row["meal_name"], key=f"ef_name_{meal_id}")
-                            e_cal  = ef_col3.number_input("Cal", min_value=0, max_value=5000, step=5,
-                                                          value=int(row["calories"]), key=f"ef_cal_{meal_id}")
-                            fs1, fs2 = st.columns(2)
-                            if fs1.form_submit_button("Save", type="primary"):
-                                if e_name.strip():
-                                    update_planned_meal(meal_id, uid, e_type, e_name.strip(), e_cal)
-                                    st.session_state.pop("editing_planned_id", None)
-                                    st.session_state["_goto_tab"] = 4
-                                    st.rerun()
-                            if fs2.form_submit_button("Cancel"):
-                                st.session_state.pop("editing_planned_id", None)
-                                st.session_state["_goto_tab"] = 4
-                                st.rerun()
+    with get_conn() as _plw:
+        _pl_lw = _plw.execute(
+            "SELECT weight_lbs FROM weight_logs WHERE user_id=? ORDER BY date DESC LIMIT 1", (uid,)
+        ).fetchone()
+    _default_cals = ((_calc_tdee(profile, _pl_lw["weight_lbs"]) or 2300) - 500) if _pl_lw else 1800
+    _default_cals = max(800, min(5000, _default_cals))
+
+    pl1, pl2 = st.columns(2)
+    with pl1:
+        period         = st.radio("Plan for", ["Daily", "Weekly"], horizontal=True, key="pl_period")
+        calorie_target = st.number_input("Daily calorie target", min_value=800, max_value=5000,
+                                         value=_default_cals, step=50, key="pl_cals")
+    with pl2:
+        dietary_prefs = st.text_input("Dietary preferences",
+                                      value=profile["dietary_prefs"] or "" if profile else "",
+                                      placeholder="e.g. vegetarian, low-carb", key="pl_prefs")
+        allergies     = st.text_input("Allergies / avoid",
+                                      value=profile["allergies"] or "" if profile else "",
+                                      placeholder="e.g. nuts, dairy", key="pl_allergies")
+
+    ingredients = st.text_area("Ingredients you have (optional)",
+                                placeholder="e.g. chicken, broccoli, eggs…", height=60, key="pl_ing")
+
+    if st.button("Generate Meal Plan", type="primary", use_container_width=True):
+        if _check_rate_limit(uid):
+            with st.spinner("Building your meal plan…"):
+                _new_plan = generate_meal_plan(
+                    calorie_target, period, dietary_prefs, allergies, ingredients, profile=profile
+                )
+            increment_usage(uid)
+            st.session_state["new_plan_text"]   = _new_plan
+            st.session_state["new_plan_period"] = period
+
+    if "new_plan_text" in st.session_state:
+        _np_text   = st.session_state["new_plan_text"]
+        _np_parsed = _parse_meal_plan(_np_text)
+
+        if _np_parsed:
+            _np_days = sorted(set(m["day"] for m in _np_parsed))
+            for _nd in _np_days:
+                _nd_meals = [m for m in _np_parsed if m["day"] == _nd]
+                _nd_total = sum(m["calories"] for m in _nd_meals)
+                if len(_np_days) > 1:
+                    st.markdown(f"**Day {_nd}** — {_nd_total:,} cal")
+                _nph = st.columns([2, 5, 2])
+                _nph[0].markdown("**Meal**"); _nph[1].markdown("**Food**"); _nph[2].markdown("**Cal**")
+                for _nm in _nd_meals:
+                    _npc = st.columns([2, 5, 2])
+                    _npc[0].write(_nm["type"]); _npc[1].write(_nm["name"]); _npc[2].write(f"{_nm['calories']:,}")
+                if len(_np_days) > 1:
+                    st.divider()
+        else:
+            st.markdown(_np_text)
+
+        _na1, _na2 = st.columns(2)
+        with _na1:
+            if st.button("Start today", type="primary", use_container_width=True):
+                if _np_parsed:
+                    _saved_pid = save_meal_plan(uid, st.session_state["new_plan_period"], _np_text)
+                    _meals_dated = [
+                        {**m, "planned_date": str(date.today() + pd.Timedelta(days=m["day"] - 1))}
+                        for m in _np_parsed
+                    ]
+                    activate_meal_plan(uid, _saved_pid, _meals_dated)
+                    st.session_state.pop("new_plan_text", None)
+                    st.session_state.pop("new_plan_period", None)
+                    st.success("Plan activated! Check off meals above as you eat them.")
+                    st.session_state["_goto_tab"] = 3
+                    st.rerun()
+                else:
+                    st.warning("Could not parse this plan — try regenerating.")
+        with _na2:
+            st.download_button("Download", data=_np_text, file_name="meal_plan.txt",
+                               mime="text/plain", use_container_width=True)
+
+    # ── Clear plan ────────────────────────────────────────────────────────────
+    if all_planned:
+        st.divider()
+        if st.button("Clear all scheduled meals", type="secondary"):
+            with get_conn() as _clr:
+                _clr.execute("DELETE FROM planned_meals WHERE user_id=?", (uid,))
+                _clr.commit()
+            st.session_state["_goto_tab"] = 3
+            st.rerun()
 
 
 # ── Tab 5: Calorie Lookup ─────────────────────────────────────────────────────
