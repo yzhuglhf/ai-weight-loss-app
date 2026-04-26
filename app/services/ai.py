@@ -1,9 +1,20 @@
 import base64
+import os
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# On Streamlit Cloud, secrets are injected as env vars via the Secrets manager.
+# Fall back to st.secrets if the env var isn't present (e.g. during local dev
+# where a secrets.toml is used instead of a .env file).
+if not os.environ.get("ANTHROPIC_API_KEY"):
+    try:
+        import streamlit as st
+        os.environ["ANTHROPIC_API_KEY"] = st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
 
 client = Anthropic()
 
